@@ -7,6 +7,11 @@ pdfplumber>=0.11
 docx2txt>=0.8
 pandas>=2.1
 numpy>=1.25
-chromadb==0.5.5
 selenium>=4.22      # optional; app won’t break if unused
 webdriver-manager>=4.0
+
+# Chroma + deps (ok on Streamlit Cloud)
+chromadb==0.5.5
+duckdb>=0.10
+pydantic>=2.7
+typing_extensions>=4.8
