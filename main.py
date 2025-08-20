@@ -31,76 +31,9 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
-
-# =========================
-# Chroma (unified, cloud-friendly)
-# =========================
-import os
-from importlib import metadata as _md
-
-CHROMA_IMPORT_ERR = None
-try:
-    import chromadb as chroma_mod   # << use this name everywhere
-    try:
-        CHROMA_VERSION = _md.version("chromadb")
-    except Exception:
-        CHROMA_VERSION = "unknown"
-    CHROMA_OK = True                # << use this flag everywhere
-except Exception as _e:
-    chroma_mod = None
-    CHROMA_VERSION = None
-    CHROMA_OK = False
-    CHROMA_IMPORT_ERR = repr(_e)
-
-# Try to import chroma, but don't fail the app if unavailable
-try:
-    import chromadb as chroma_mod
-    try:
-        _CHROMA_VERSION = _md.version("chromadb")
-    except Exception:
-        _CHROMA_VERSION = "unknown"
-    CHROMA_OK = True
-except Exception:
-    chroma_mod = None
-    _CHROMA_VERSION = None
-    CHROMA_OK = False
-
-# Use /tmp on Streamlit Cloud
-CHROMA_DIR = os.getenv("CHROMA_DIR", "/tmp/chroma_db")
-CHROMA_COLLECTION = "cv_store"
-
-def _get_chroma_collection():
-    """Return a Chroma collection or None (caller will fallback to SimpleStore)."""
-    if not CHROMA_OK or chroma_mod is None:
-        return None
-    # Try persistent first
-    try:
-        client = chroma_mod.PersistentClient(path=CHROMA_DIR)
-    except Exception:
-        # Fall back to in-memory (works on Streamlit Cloud)
-        try:
-            client = chroma_mod.EphemeralClient()
-        except Exception:
-            return None
-    # Create/get collection (new/old API)
-    try:
-        return client.get_or_create_collection(name=CHROMA_COLLECTION, metadata={"hnsw:space": "cosine"})
-    except TypeError:
-        return client.get_or_create_collection(name=CHROMA_COLLECTION)
-
-def _chroma_count(col) -> int:
-    try:
-        return col.count()
-    except Exception:
-        try:
-            res = col.get()
-            return len(res.get("ids", []))
-        except Exception:
-            return 0
+import numpy as np
 
 # ---------- Session-backed fallback store (always works on Streamlit Cloud) ----------
-import numpy as _np
-
 class SessionStore:
     """Tiny cosine-similarity store kept in st.session_state (no disk)."""
     _DOCS_KEY = "ss_docs"
@@ -114,7 +47,6 @@ class SessionStore:
         st.session_state.setdefault(self._IDS_KEY, [])
         st.session_state.setdefault(self._EMBS_KEY, [])
 
-    # Internal getters
     @property
     def _docs(self) -> list[str]:
         return st.session_state[self._DOCS_KEY]
@@ -135,10 +67,9 @@ class SessionStore:
         self._docs.extend(documents)
         self._metas.extend(metadatas)
         self._ids.extend(ids)
-        # ensure embeddings are plain Python lists of floats
         for v in embeddings:
-            if isinstance(v, _np.ndarray):
-                self._embs.append([float(x) for x in v.tolist()])
+            if isinstance(v, np.ndarray):
+                self._embs.append(v.astype(float).tolist())
             else:
                 self._embs.append([float(x) for x in v])
 
@@ -149,20 +80,24 @@ class SessionStore:
         if not self._embs:
             return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
 
-        q = _np.array(query_embeddings[0], dtype=_np.float32)
-        A = _np.array(self._embs, dtype=_np.float32)
+        q = np.array(query_embeddings[0], dtype=np.float32)
+        A = np.array(self._embs, dtype=np.float32)
 
         # cosine similarity
-        denom = (_np.linalg.norm(A, axis=1) * _np.linalg.norm(q) + 1e-12)
+        denom = (np.linalg.norm(A, axis=1) * np.linalg.norm(q) + 1e-12)
         sims = (A @ q) / denom
-        idx = _np.argsort(-sims)[:n_results]
+        idx = np.argsort(-sims)[:n_results]
 
         docs = [self._docs[i] for i in idx]
         metas = [self._metas[i] for i in idx]
-        dists = [float(1.0 - sims[i]) for i in idx]
+        dists = [float(1.0 - sims[i]) for i in idx]  # lower = closer
         ids = [self._ids[i] for i in idx]
 
         return {"documents": [docs], "metadatas": [metas], "distances": [dists], "ids": [ids]}
+
+# Always use SessionStore
+def _get_store():
+    return SessionStore(), "SessionStore (in-memory)"
 
 # --- Optional file parsers ---
 try:
@@ -220,8 +155,26 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
-# --- OpenAI client ---
-from openai import OpenAI
+# --- OpenAI version-aware imports/initialization ---
+try:
+    from openai import OpenAI  # v1+
+except Exception:
+    OpenAI = None
+
+import openai as openai_module  # works for both v1+ (module exists) and legacy 0.x
+OPENAI_PY_VERSION = getattr(openai_module, "__version__", "0")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# Create a client for v1+, or set module api_key for legacy 0.x
+if OPENAI_API_KEY:
+    if OpenAI is not None and not OPENAI_PY_VERSION.startswith("0."):
+        client = OpenAI(api_key=OPENAI_API_KEY)   # v1+
+    else:
+        openai_module.api_key = OPENAI_API_KEY    # legacy 0.x
+        client = None                              # use compat helpers below
+else:
+    client = None
 
 def _job_kwargs(**pairs):
     """Filter to only the fields that exist on the Job dataclass."""
@@ -230,23 +183,18 @@ def _job_kwargs(**pairs):
 
 # Accept both `texts=` and legacy `input=` kwargs
 @st.cache_data(show_spinner=False)
-def embed_texts(texts: list[str] | None = None,
-                model: str = "text-embedding-3-small",
-                **kwargs) -> list[list[float]]:
-    # Allow callers to pass input=... (alias for texts)
-    if texts is None:
-        texts = kwargs.get("input") or kwargs.get("texts") or []
-    if isinstance(texts, str):
-        texts = [texts]
-    # use your compat helper to support both openai v1 and v0
-    return _create_embeddings_compat(list(texts), model)
-
-# ---- OpenAI embeddings compat (supports both v1 and legacy v0 SDKs) ----
-import openai as openai_module  # legacy fallback
-
-# Version-aware OpenAI embeddings (works on v1+ and legacy 0.x)
-import openai as openai_module
-OPENAI_PY_VERSION = getattr(openai_module, "__version__", "0")
+def embed_texts(texts: list[str], model: str = "text-embedding-3-small") -> list[list[float]]:
+    if client is None:
+        raise RuntimeError("OpenAI client not configured. Set OPENAI_API_KEY.")
+    if not texts:
+        return []
+    if not OPENAI_PY_VERSION.startswith("0."):  # v1+
+        resp = client.embeddings.create(model=model, input=texts)
+        return [d.embedding for d in resp.data]
+    # legacy v0.x
+    openai_module.api_key = OPENAI_API_KEY
+    resp = openai_module.Embedding.create(model=model, input=texts)
+    return [d["embedding"] for d in resp["data"]]
 
 def _create_embeddings_compat(texts: list[str], model: str = "text-embedding-3-small") -> list[list[float]]:
     if not texts:
@@ -264,104 +212,47 @@ def _create_embeddings_compat(texts: list[str], model: str = "text-embedding-3-s
     return [d["embedding"] for d in resp["data"]]
 
 @st.cache_data(show_spinner=False)
+# ---- Embeddings compat (v1+ and legacy 0.x) ----
+@st.cache_data(show_spinner=False)
 def embed_texts(texts: list[str], model: str = "text-embedding-3-small") -> list[list[float]]:
-    return _create_embeddings_compat(texts, model)
+    if not texts:
+        return []
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OpenAI API key missing")
 
-# -----------------------------
-# Chroma (local, file-based) RAG for CVs
-CHROMA_DIR = os.path.join(os.getcwd(), "chroma_db")  # change if you want another folder
-CHROMA_COLLECTION = "cv_store"
+    # v1+ path
+    if OpenAI is not None and not OPENAI_PY_VERSION.startswith("0."):
+        resp = client.embeddings.create(model=model, input=texts)
+        return [d.embedding for d in resp.data]
 
-# --- Embedding wrapper (works even if embed_texts isn't defined yet) ---
-def embed_texts(texts: list[str], model: str = "text-embedding-3-small") -> list[list[float]]:
-    return _create_embeddings_compat(texts, model)
-    # Prefer your existing embed_texts if present
-    try:
-        return embed_texts(texts, model=model)  # uses your cached helper if defined
-    except NameError:
-        pass  # fall back to a local minimal implementation
+    # legacy 0.x
+    resp = openai_module.Embedding.create(model=model, input=texts)
+    return [d["embedding"] for d in resp["data"]]
 
-    # Fallback: direct OpenAI call
-    if client is None:
-        raise RuntimeError("OpenAI client not configured. Set OPENAI_API_KEY.")
-    vectors: List[List[float]] = []
-    BATCH = 200
-    for i in range(0, len(texts), BATCH):
-        batch = texts[i:i+BATCH]
-        resp = embed_texts(batch, model=model)
-        vectors.extend([d.embedding for d in resp.data])
-    return vectors
+# ---- Chat completions compat (returns string content) ----
+def chat_complete(system: str, user: str, model: str = "gpt-4o-mini",
+                  temperature: float = 0.0, response_format: dict | None = None) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OpenAI API key missing")
 
-CHROMA_DIR = os.path.join(os.getcwd(), "chroma_db")  # keep your existing path
+    # v1+ path
+    if OpenAI is not None and not OPENAI_PY_VERSION.startswith("0."):
+        kwargs = {"model": model, "temperature": temperature,
+                  "messages": [{"role": "system", "content": system},
+                               {"role": "user", "content": user}]}
+        if response_format:
+            kwargs["response_format"] = response_format
+        resp = client.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content
 
-# Use /tmp on Streamlit Cloud for ephemeral write access
-CHROMA_DIR = os.getenv("CHROMA_DIR", "/tmp/chroma_db")
-CHROMA_COLLECTION = "cv_store"
-
-def _get_store():
-    """
-    Prefer a Chroma collection if available; otherwise use SessionStore (in-memory).
-    Returns (store_obj, store_name_str).
-    """
-    try:
-        col = _get_chroma_collection()  # your existing function that returns a Chroma collection or None
-    except Exception:
-        col = None
-
-    if col is not None:
-        # Chroma path
-        store_name = f"Chroma ({CHROMA_VERSION or '?'})"
-        return col, store_name
-
-    # SessionStore fallback (works on Streamlit Cloud)
-    return SessionStore(), "SessionStore (in-memory)"
-
-def _get_chroma_client():
-    """Return a Chroma client; try persistent, then ephemeral; else None."""
-    if not CHROMA_OK or chroma_mod is None:
-        # show real reason so you can fix requirements
-        st.warning(f"Chroma import failed on this deployment. Falling back to SimpleStore.\n\nImport error: {CHROMA_IMPORT_ERR}")
-        return None
-    # 0.5.x PersistentClient
-    try:
-        return chroma_mod.PersistentClient(path=CHROMA_DIR)
-    except Exception as e_persist:
-        # Ephemeral client works on Streamlit Cloud
-        try:
-            st.info("Using Chroma EphemeralClient (in-memory) on this deployment.")
-            return chroma_mod.EphemeralClient()
-        except Exception as e_ephem:
-            # Legacy 0.3.x fallback
-            if ChromaSettings is not None:
-                try:
-                    return chroma_mod.Client(ChromaSettings(
-                        chroma_db_impl="duckdb+parquet",
-                        persist_directory=CHROMA_DIR
-                    ))
-                except Exception as e_legacy:
-                    st.warning(f"Chroma init failed (persist={e_persist} | ephemeral={e_ephem} | legacy={e_legacy}). Falling back to SimpleStore.")
-                    return None
-            else:
-                st.warning(f"Chroma init failed (persist={e_persist} | ephemeral={e_ephem}). Falling back to SimpleStore.")
-                return None
-
-def _get_cv_collection(chroma_client):
-    if chroma_client is None:
-        return None
-    try:
-        return chroma_client.get_or_create_collection(name=CHROMA_COLLECTION, metadata={"hnsw:space": "cosine"})
-    except TypeError:
-        return chroma_client.get_or_create_collection(name=CHROMA_COLLECTION)
-
-def _chroma_count(col) -> int:
-    try:
-        return col.count()
-    except Exception:
-        try:
-            res = col.get()
-            return len(res.get("ids", []))
-        except Exception:
-            return 0
+    # legacy 0.x (no response_format support)
+    resp = openai_module.ChatCompletion.create(
+        model=model,
+        temperature=temperature,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+    )
+    return resp["choices"][0]["message"]["content"]
 
 # Config
 # -----------------------------
@@ -2631,26 +2522,15 @@ def scrape_careers_gov(start_page: int, end_page: int, per_page_cap: Optional[in
             pass
 
 def extract_profile_from_cv(cv_text: str) -> CandidateProfile:
-    if client is None:
-        raise RuntimeError("OpenAI client not configured. Set OPENAI_API_KEY.")
-    system = (
-        "You are an expert career analyst. Extract concise skills as short phrases, "
-        "roles (titles), industries, and a 3-4 sentence professional summary from the CV text. "
-        "Return strict JSON with keys: skills (string array), roles (string array), industries (string array), summary (string)."
-    )
-    user = (
-        "CV text:\n" + cv_text[:25000]
-    )
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-    data = json.loads(resp.choices[0].message.content)
+    system = ("You are an expert career analyst. Extract concise skills as short phrases, "
+              "roles (titles), industries, and a 3-4 sentence professional summary from the CV text. "
+              'Return strict JSON with keys: skills (string array), roles (string array), '
+              'industries (string array), summary (string).')
+    user = "CV text:\n" + cv_text[:25000]
+    content = chat_complete(system, user, model="gpt-4o-mini",
+                            temperature=0.0,
+                            response_format={"type": "json_object"})
+    data = json.loads(content)
     skills = [clean_text(s) for s in data.get("skills", []) if isinstance(s, str)]
     roles = [clean_text(s) for s in data.get("roles", []) if isinstance(s, str)]
     industries = [clean_text(s) for s in data.get("industries", []) if isinstance(s, str)]
@@ -2706,10 +2586,7 @@ def score_matches(jobs: List[Job], candidate_profile: CandidateProfile) -> pd.Da
     df = pd.DataFrame(rows).sort_values(["similarity", "overlap_count"], ascending=[False, False])
     return df
 
-
 def explain_match(job: Job, candidate_profile: CandidateProfile) -> str:
-    if client is None:
-        return "OpenAI not configured."
     prompt = (
         "In 5 bullet points, explain why this candidate may be a fit for the job. "
         "Base your reasoning on explicit evidence from the job text and the candidate skills."
@@ -2717,24 +2594,15 @@ def explain_match(job: Job, candidate_profile: CandidateProfile) -> str:
         f"Job Text (excerpt): {job.description[:1800]}\n"
         f"Candidate Skills: {', '.join(candidate_profile.skills)}\n"
     )
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": "You are an expert technical recruiter."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return resp.choices[0].message.content
-
+    system = "You are an expert technical recruiter."
+    return chat_complete(system, prompt, model="gpt-4o-mini", temperature=0.2)
 
 # -----------------------------
 # UI
 # -----------------------------
 
-st.title("Careers@Gov — CV ↔ Job Matcher")
-st.caption("Scrape public job postings, parse your CV, and see best-fit roles based on semantic similarity and skill overlap.")
-
+st.title("Careers@Gov Job Matcher")
+st.caption("Scrape public job postings, parse your CV, and see best-fit roles based on semantic similarity and skill overlap. Upload multiple CVs and query them for relevant experience needed for best-fit ")
 with st.sidebar:
     st.header("Data Source")
     use_sample = st.toggle("Use 15 Aug 2025 Careers@Gov scrapped dataset (skip scraping)", value=False)
@@ -2855,9 +2723,8 @@ if cv_file:
 from uuid import uuid4
 
 def index_cv_docs_to_store(files: list, label_prefix: str = "cv"):
-    store, store_name = _get_store()
+    store, _ = _get_store()
     docs, metas, ids = [], [], []
-
     for f in files:
         try:
             text = read_cv_file(f)
@@ -2868,67 +2735,43 @@ def index_cv_docs_to_store(files: list, label_prefix: str = "cv"):
             ids.append(f"{label_prefix}-{uuid4().hex[:12]}")
         except Exception as e:
             st.warning(f"Failed to read {getattr(f, 'name', 'file')}: {e}")
-
     if not docs:
         return 0, []
 
-    # Embed
+    # Use your existing embed_texts(...) (version-safe) helper
     try:
-        vecs = embed_texts(docs)  # your fixed compat wrapper
+        vecs = embed_texts(docs)
     except Exception as e:
         st.error(f"Embedding failed: {e}")
         return 0, []
 
-    # Add to whichever store we have
     try:
-        # Both Chroma and SessionStore expose .add(documents=..., metadatas=..., ids=..., embeddings=...)
         store.add(documents=docs, metadatas=metas, ids=ids, embeddings=vecs)
-        # Best-effort persist for Chroma (SessionStore is in-memory)
-        try:
-            if hasattr(store, "client") and hasattr(store.client, "persist"):
-                store.client.persist()
-        except Exception:
-            pass
         return len(ids), ids
     except Exception as e:
         st.error(f"Add to store failed: {e}")
         return 0, []
 
 def query_cv_store(question: str, top_k: int = 5):
-    store, store_name = _get_store()
-
-    # Count
+    store, _ = _get_store()
     try:
-        current = store.count()
+        if store.count() == 0:
+            return {"documents":[[]], "metadatas":[[]], "distances":[[]], "ids":[[]]}
     except Exception:
-        current = 0
+        return {"documents":[[]], "metadatas":[[]], "distances":[[]], "ids":[[]]}
 
-    if current == 0:
-        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
-
-    # Embed query
     try:
         q_vec = embed_texts([question])[0]
     except Exception as e:
         st.error(f"Embedding query failed: {e}")
-        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+        return {"documents":[[]], "metadatas":[[]], "distances":[[]], "ids":[[]]}
 
-    # Query (Chroma and SessionStore both implement .query(...))
     try:
-        # Chroma supports include=..., SessionStore ignores it by not accepting the kw
-        if hasattr(store, "query"):
-            try:
-                return store.query(query_embeddings=[q_vec], n_results=int(top_k),
-                                   include=["documents", "metadatas", "distances"])
-            except TypeError:
-                # SessionStore path (no include kw)
-                return store.query(query_embeddings=[q_vec], n_results=int(top_k))
-        else:
-            # Extremely defensive fallback
-            return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+        # SessionStore implements .query(query_embeddings=[...], n_results=int)
+        return store.query(query_embeddings=[q_vec], n_results=int(top_k))
     except Exception as e:
         st.error(f"Store query failed: {e}")
-        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+        return {"documents":[[]], "metadatas":[[]], "distances":[[]], "ids":[[]]}
 
 def rag_answer_over_cvs(question: str, retrieved, model: str = "gpt-4o-mini") -> str:
     """
@@ -2997,112 +2840,6 @@ def read_cv_file(uploaded) -> str:
         return _clean(content.decode("utf-8", errors="ignore"))
     except Exception:
         return _clean(content.decode("latin-1", errors="ignore"))
-
-# -----------------------------
-# Local RAG over Uploaded CVs (Chroma)
-# -----------------------------
-st.markdown("## 1b) CV Knowledge Base (Local, File-based RAG)")
-with st.expander("Build & Query Local CV Store (Chroma)", expanded=False):
-    if not CHROMA_OK or chroma_mod is None:
-      st.warning("Chroma is not available on this deployment.")
-      st.stop()  # or return gracefully from the section
-    else:
-        chroma_client = _get_chroma_client()
-        col = _get_cv_collection(chroma_client)
-        current_count = _chroma_count(col) if col else 0
-        store_obj, store_name = _get_store()
-        st.caption(f"Vector store: {store_name}")
-
-
-
-        uploaded_cvs = st.file_uploader(
-            "Upload multiple CV files (PDF/DOCX/TXT) to index into the local store",
-            type=["pdf", "docx", "txt"],
-            accept_multiple_files=True,
-            key="rag_cv_uploader"
-        )
-
-        col_i, col_q = st.columns([1, 2])
-        with col_i:
-            if st.button("Add to Local Store", use_container_width=True, key="btn_add_cvs"):
-                if not uploaded_cvs:
-                    st.info("Upload at least one CV file first.")
-                else:
-                    with st.spinner("Indexing CVs into local store…"):
-                        added_count, ids = index_cv_docs_to_store(uploaded_cvs)
-                        if added_count:
-                            st.success(f"Indexed {added_count} document(s) into the local store.")
-                        else:
-                            st.warning("No documents were indexed.")
-                # refresh count
-                col = _get_cv_collection(_get_chroma_client())
-                st.caption(f"📦 Stored CV documents: **{_chroma_count(col)}**")
-
-        with col_q:
-            # --- Search the local CV store ---
-            question = st.text_input(
-                "Ask a question about the stored CVs (e.g., 'Who has React and NLP experience?')",
-                key="rag_query"
-            )
-            topk = st.slider("How many results to retrieve?", 1, 10, 5, key="rag_topk")
-            if st.button("Search CV Store", use_container_width=True, key="btn_query_cvs"):
-                if not question.strip():
-                    st.info("Enter a question first.")
-                else:
-                    with st.spinner("Retrieving similar CV snippets…"):
-                        retrieved = query_cv_store(question, top_k=topk)
-                        if not retrieved or not retrieved.get("documents"):
-                            st.warning("No results found in local store.")
-                            st.session_state["rag_results"] = None
-                            st.session_state["rag_question"] = None
-                        else:
-                            # show hits
-                            docs = retrieved["documents"][0]
-                            metas = retrieved["metadatas"][0]
-                            dists = retrieved.get("distances", [[None]*len(docs)])[0]
-                            df_hits = pd.DataFrame([
-                                {
-                                    "filename": (metas[i] or {}).get("filename", f"doc_{i+1}"),
-                                    "distance": (dists[i] if dists and len(dists) > i else None),
-                                    "preview": (docs[i] or "")[:240] + ("…" if docs[i] and len(docs[i]) > 240 else "")
-                                } for i in range(len(docs))
-                            ])
-                            st.subheader("Nearest CV Snippets")
-                            st.dataframe(df_hits, use_container_width=True, hide_index=True)
-
-                            # PERSIST for next rerun (so the Summarize button can use them)
-                            st.session_state["rag_results"] = retrieved
-                            st.session_state["rag_question"] = question
-
-             # --- Summarize with GPT (works across reruns) ---
-            saved_results = st.session_state.get("rag_results")
-            saved_question = st.session_state.get("rag_question")
-            if saved_results and saved_question:
-                if st.button("Summarize with GPT (RAG)", key="btn_rag_summarize_v2"):
-                    if client is None:
-                        st.error("OpenAI not configured. Set OPENAI_API_KEY.")
-                    else:
-                        with st.spinner("Composing answer…"):
-                            answer = rag_answer_over_cvs(saved_question, saved_results)
-                            st.markdown("### Answer")
-                            st.write(answer)
-
-        # Utility: clear local store
-        if st.button("Clear Local CV Store", key="btn_clear_chroma"):
-            try:
-                # safest way: delete collection
-                c = _get_cv_collection(_get_chroma_client())
-                if c:
-                    try:
-                        _get_chroma_client().delete_collection(CHROMA_COLLECTION)  # new API
-                    except Exception:
-                        # fallback: recreate empty collection by deleting and re-creating dir (nuclear option)
-                        import shutil
-                        if os.path.isdir(CHROMA_DIR):
-                            shutil.rmtree(CHROMA_DIR, ignore_errors=True)
-                st.success("Local CV store cleared.")
-            except Exception as e:
-                st.error(f"Failed to clear store: {e}")
 
 # --- Matching ---
 st.markdown("## 2) Find Matches")
@@ -3194,6 +2931,73 @@ if isinstance(results_df, pd.DataFrame) and not results_df.empty:
                     st.write(exp)
                 except Exception as e:
                     st.error(f"Explanation failed: {e}")
+
+st.markdown("## 3) Local CV Store (in-memory)")
+
+store_obj, store_name = _get_store()
+st.caption(f"Vector store: {store_name}")
+
+uploaded_cvs = st.file_uploader(
+    "Upload multiple CV files (PDF/DOCX/TXT) to index",
+    type=["pdf", "docx", "txt"],
+    accept_multiple_files=True,
+    key="rag_cv_uploader"
+)
+
+c_i, c_q = st.columns([1, 2])
+with c_i:
+    if st.button("Add to Local Store to index", key="btn_add_cvs"):
+        if not uploaded_cvs:
+            st.info("Upload at least one CV file first.")
+        else:
+            with st.spinner("Indexing CVs…"):
+                added_count, ids = index_cv_docs_to_store(uploaded_cvs)
+                if added_count:
+                    st.success(f"Indexed {added_count} document(s).")
+                else:
+                    st.warning("No documents were indexed.")
+
+with c_q:
+    question = st.text_input("Ask a question about the stored CVs", key="rag_query")
+    topk = st.slider("How many results to retrieve?", 1, 10, 5, key="rag_topk")
+    if st.button("Search CV Store", key="btn_query_cvs"):
+        if not question.strip():
+            st.info("Enter a question first.")
+        else:
+            with st.spinner("Retrieving similar CV snippets…"):
+                retrieved = query_cv_store(question, top_k=topk)
+                docs = retrieved.get("documents", [[]])[0]
+                metas = retrieved.get("metadatas", [[]])[0]
+                dists = retrieved.get("distances", [[]])[0]
+                if not docs:
+                    st.warning("No results found in local store.")
+                    st.session_state["rag_results"] = None
+                    st.session_state["rag_question"] = None
+                else:
+                    df_hits = pd.DataFrame([
+                        {
+                            "filename": (metas[i] or {}).get("filename", f"doc_{i+1}"),
+                            "distance": dists[i] if dists and len(dists) > i else None,
+                            "preview": (docs[i] or "")[:240] + ("…" if docs[i] and len(docs[i]) > 240 else "")
+                        } for i in range(len(docs))
+                    ])
+                    st.subheader("Nearest CV Snippets")
+                    st.dataframe(df_hits, use_container_width=True, hide_index=True)
+                    st.session_state["rag_results"] = retrieved
+                    st.session_state["rag_question"] = question
+
+# Summarize with GPT (RAG) – uses saved results
+saved_results = st.session_state.get("rag_results")
+saved_question = st.session_state.get("rag_question")
+if saved_results and saved_question:
+    if st.button("Summarize with GPT (RAG)", key="btn_rag_summarize_v2"):
+        if client is None:
+            st.error("OpenAI not configured. Set OPENAI_API_KEY.")
+        else:
+            with st.spinner("Composing answer…"):
+                answer = rag_answer_over_cvs(saved_question, saved_results)
+                st.markdown("### Answer")
+                st.write(answer)
 
 st.markdown("---")
 st.caption(
