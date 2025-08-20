@@ -33,11 +33,19 @@ import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 # --- Local vector store (Chroma) ---
+# --- Local vector store (Chroma) ---
 try:
-    import chromadb
-    from chromadb.config import Settings  # optional (older API needs this)
+    import chromadb as chroma_mod  # don't shadow with the same name
+    CHROMA_OK = True
 except Exception:
-    chromadb = None
+    chroma_mod = None
+    CHROMA_OK = False
+
+# Settings is optional (older Chroma API); don't fail if missing
+try:
+    from chromadb.config import Settings as ChromaSettings  # optional
+except Exception:
+    ChromaSettings = None
 
 # --- Optional file parsers ---
 try:
@@ -167,18 +175,29 @@ def embed_texts(texts: list[str], model: str = "text-embedding-3-small") -> list
         vectors.extend([d.embedding for d in resp.data])
     return vectors
 
+CHROMA_DIR = os.path.join(os.getcwd(), "chroma_db")  # keep your existing path
+
 def _get_chroma_client():
-    if chromadb is None:
-        st.error("Chroma is not installed. Run: pip install chromadb")
+    if not CHROMA_OK or chroma_mod is None:
+        st.error("Chroma is not available. Install with: pip install chromadb")
         return None
-    # Newer API
+    # Prefer modern API (0.5.x)
     try:
-        client = chromadb.PersistentClient(path=CHROMA_DIR)
-    except TypeError:
-        # Older API fallback
-        from chromadb.config import Settings
-        client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=CHROMA_DIR))
-    return client
+        return chroma_mod.PersistentClient(path=CHROMA_DIR)
+    except Exception:
+        # Older API fallback (0.3.x) using Settings
+        if ChromaSettings is None:
+            st.error("Your Chroma version lacks PersistentClient and Settings. "
+                     "Either upgrade chromadb>=0.5 or pin to a compatible 0.3.x with Settings.")
+            return None
+        try:
+            return chroma_mod.Client(ChromaSettings(
+                chroma_db_impl="duckdb+parquet",
+                persist_directory=CHROMA_DIR
+            ))
+        except Exception as e:
+            st.error(f"Failed to create Chroma client: {e}")
+            return None
 
 def _get_cv_collection(client):
     if client is None:
@@ -2841,8 +2860,8 @@ def read_cv_file(uploaded) -> str:
 # -----------------------------
 st.markdown("## 1b) CV Knowledge Base (Local, File-based RAG)")
 with st.expander("Build & Query Local CV Store (Chroma)", expanded=False):
-    if chromadb is None:
-        st.warning("Chroma is not installed. Run: `pip install chromadb`")
+    if not CHROMA_OK or chroma_mod is None:
+      st.warning("Chroma is not installed. Run: `pip install chromadb`")
     else:
         chroma_client = _get_chroma_client()
         col = _get_cv_collection(chroma_client)
