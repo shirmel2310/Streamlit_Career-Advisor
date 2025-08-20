@@ -32,18 +32,24 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
-# --- Local vector store (Chroma) ---
-# --- Local vector store (Chroma) ---
-try:
-    import chromadb as chroma_mod  # don't shadow with the same name
-    CHROMA_OK = True
-except Exception:
-    chroma_mod = None
-    CHROMA_OK = False
 
-# Settings is optional (older Chroma API); don't fail if missing
+# --- Local vector store (Chroma) ---
+from importlib import metadata as _md
+
+CHROMA_IMPORT_ERR = None
 try:
-    from chromadb.config import Settings as ChromaSettings  # optional
+    import chromadb as chroma_mod  # don't shadow your OpenAI `client`
+    CHROMA_VERSION = _md.version("chromadb")
+    CHROMA_OK = True
+except Exception as _e:
+    chroma_mod = None
+    CHROMA_VERSION = None
+    CHROMA_OK = False
+    CHROMA_IMPORT_ERR = repr(_e)
+
+# Optional Settings (older API); absence should NOT mark Chroma as missing
+try:
+    from chromadb.config import Settings as ChromaSettings  # optional for 0.3.x
 except Exception:
     ChromaSettings = None
 
@@ -177,44 +183,56 @@ def embed_texts(texts: list[str], model: str = "text-embedding-3-small") -> list
 
 CHROMA_DIR = os.path.join(os.getcwd(), "chroma_db")  # keep your existing path
 
+# Use /tmp on Streamlit Cloud for ephemeral write access
+CHROMA_DIR = os.getenv("CHROMA_DIR", "/tmp/chroma_db")
+CHROMA_COLLECTION = "cv_store"
+
 def _get_chroma_client():
+    """Return a Chroma client. Prefer persistent; fall back to ephemeral on cloud."""
     if not CHROMA_OK or chroma_mod is None:
-        st.error("Chroma is not available. Install with: pip install chromadb")
+        # show the real reason in UI
+        st.error(f"Chroma unavailable. Install chromadb. Import error: {CHROMA_IMPORT_ERR}")
         return None
-    # Prefer modern API (0.5.x)
+
+    # 0.5.x path (PersistentClient / EphemeralClient)
     try:
         return chroma_mod.PersistentClient(path=CHROMA_DIR)
-    except Exception:
-        # Older API fallback (0.3.x) using Settings
-        if ChromaSettings is None:
-            st.error("Your Chroma version lacks PersistentClient and Settings. "
-                     "Either upgrade chromadb>=0.5 or pin to a compatible 0.3.x with Settings.")
-            return None
+    except Exception as e_persist:
+        # Fall back to in-memory (works well on Streamlit Cloud)
         try:
-            return chroma_mod.Client(ChromaSettings(
-                chroma_db_impl="duckdb+parquet",
-                persist_directory=CHROMA_DIR
-            ))
-        except Exception as e:
-            st.error(f"Failed to create Chroma client: {e}")
-            return None
+            st.info("Using Chroma EphemeralClient (in-memory store) on this deployment.")
+            return chroma_mod.EphemeralClient()
+        except Exception as e_ephem:
+            # Older 0.3.x fallback if available
+            if ChromaSettings is not None:
+                try:
+                    return chroma_mod.Client(ChromaSettings(
+                        chroma_db_impl="duckdb+parquet", persist_directory=CHROMA_DIR
+                    ))
+                except Exception as e_old:
+                    st.error(f"Failed to init Chroma: persistent={e_persist} | ephemeral={e_ephem} | legacy={e_old}")
+                    return None
+            else:
+                st.error(f"Failed to init Chroma: persistent={e_persist} | ephemeral={e_ephem}")
+                return None
 
-def _get_cv_collection(client):
-    if client is None:
+def _get_cv_collection(chroma_client):
+    if chroma_client is None:
         return None
     try:
-        col = client.get_or_create_collection(name=CHROMA_COLLECTION, metadata={"hnsw:space": "cosine"})
+        # 0.5.x
+        return chroma_client.get_or_create_collection(
+            name=CHROMA_COLLECTION, metadata={"hnsw:space": "cosine"}
+        )
     except TypeError:
-        # Older API doesn't support metadata in get_or_create_collection
-        col = client.get_or_create_collection(name=CHROMA_COLLECTION)
-    return col
+        # older API without metadata kw
+        return chroma_client.get_or_create_collection(name=CHROMA_COLLECTION)
 
 def _chroma_count(col) -> int:
     try:
-        return col.count()  # new API
+        return col.count()
     except Exception:
         try:
-            # older API might not have .count()
             res = col.get()
             return len(res.get("ids", []))
         except Exception:
@@ -2861,7 +2879,8 @@ def read_cv_file(uploaded) -> str:
 st.markdown("## 1b) CV Knowledge Base (Local, File-based RAG)")
 with st.expander("Build & Query Local CV Store (Chroma)", expanded=False):
     if not CHROMA_OK or chroma_mod is None:
-      st.warning("Chroma is not installed. Run: `pip install chromadb`")
+      st.warning("Chroma is not available on this deployment.")
+      st.stop()  # or return gracefully from the section
     else:
         chroma_client = _get_chroma_client()
         col = _get_cv_collection(chroma_client)
