@@ -27,45 +27,83 @@ import math
 import tempfile
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any, Optional, Tuple
-import numpy as np
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
-# --- Chroma on Streamlit Cloud: tolerant import + client factory ---
+# =========================
+# Chroma (unified, cloud-friendly)
+# =========================
 import os
 from importlib import metadata as _md
 
 CHROMA_IMPORT_ERR = None
 try:
-    import chromadb as chroma_mod  # don't shadow your OpenAI `client`
+    import chromadb as chroma_mod   # << use this name everywhere
     try:
         CHROMA_VERSION = _md.version("chromadb")
     except Exception:
         CHROMA_VERSION = "unknown"
-    CHROMA_OK = True
+    CHROMA_OK = True                # << use this flag everywhere
 except Exception as _e:
     chroma_mod = None
     CHROMA_VERSION = None
     CHROMA_OK = False
     CHROMA_IMPORT_ERR = repr(_e)
 
-# Optional legacy Settings; don't fail if missing
+# Try to import chroma, but don't fail the app if unavailable
 try:
-    from chromadb.config import Settings as ChromaSettings
+    import chromadb as chroma_mod
+    try:
+        _CHROMA_VERSION = _md.version("chromadb")
+    except Exception:
+        _CHROMA_VERSION = "unknown"
+    CHROMA_OK = True
 except Exception:
-    ChromaSettings = None
+    chroma_mod = None
+    _CHROMA_VERSION = None
+    CHROMA_OK = False
 
+# Use /tmp on Streamlit Cloud
 CHROMA_DIR = os.getenv("CHROMA_DIR", "/tmp/chroma_db")
 CHROMA_COLLECTION = "cv_store"
 
-# --- Simple file-backed store (fallback when Chroma isn't available) ---
-import json, numpy as _np
+def _get_chroma_collection():
+    """Return a Chroma collection or None (caller will fallback to SimpleStore)."""
+    if not CHROMA_OK or chroma_mod is None:
+        return None
+    # Try persistent first
+    try:
+        client = chroma_mod.PersistentClient(path=CHROMA_DIR)
+    except Exception:
+        # Fall back to in-memory (works on Streamlit Cloud)
+        try:
+            client = chroma_mod.EphemeralClient()
+        except Exception:
+            return None
+    # Create/get collection (new/old API)
+    try:
+        return client.get_or_create_collection(name=CHROMA_COLLECTION, metadata={"hnsw:space": "cosine"})
+    except TypeError:
+        return client.get_or_create_collection(name=CHROMA_COLLECTION)
+
+def _chroma_count(col) -> int:
+    try:
+        return col.count()
+    except Exception:
+        try:
+            res = col.get()
+            return len(res.get("ids", []))
+        except Exception:
+            return 0
+
+# ---------- Simple fallback store (file-backed cosine) ----------
+import numpy as _np
 
 class SimpleStore:
-    """Tiny cosine-similarity store persisted to a single NPZ in /tmp."""
-    def __init__(self, path:str="/tmp/cv_simple_store.npz"):
+    """Tiny cosine-similarity store persisted to /tmp as NPZ."""
+    def __init__(self, path: str = "/tmp/cv_simple_store.npz"):
         self.path = path
         self._docs: list[str] = []
         self._metas: list[dict] = []
@@ -79,7 +117,8 @@ class SimpleStore:
             self._docs = list(data["docs"])
             self._metas = list(data["metas"])
             self._ids = list(data["ids"])
-            self._embs = _np.array(data["embs"])
+            embs = data["embs"]
+            self._embs = _np.array(embs) if embs.size else None
         except Exception:
             self._docs, self._metas, self._ids, self._embs = [], [], [], None
 
@@ -89,37 +128,33 @@ class SimpleStore:
             docs=_np.array(self._docs, dtype=object),
             metas=_np.array(self._metas, dtype=object),
             ids=_np.array(self._ids, dtype=object),
-            embs=_np.array(self._embs) if self._embs is not None else _np.zeros((0,0), dtype=_np.float32)
+            embs=_np.array(self._embs) if self._embs is not None else _np.zeros((0, 0), dtype=_np.float32),
         )
 
-    def add(self, documents:list[str], metadatas:list[dict], ids:list[str], embeddings:list[list[float]]):
+    def add(self, documents: list[str], metadatas: list[dict], ids: list[str], embeddings: list[list[float]]):
         embs = _np.array(embeddings, dtype=_np.float32)
         self._docs.extend(documents)
         self._metas.extend(metadatas)
         self._ids.extend(ids)
-        if self._embs is None or self._embs.size == 0:
-            self._embs = embs
-        else:
-            self._embs = _np.vstack([self._embs, embs])
+        self._embs = embs if self._embs is None or self._embs.size == 0 else _np.vstack([self._embs, embs])
         self._save()
 
     def count(self) -> int:
         return len(self._ids)
 
-    def query(self, query_embeddings:list[list[float]], n_results:int=5, include:list[str]|None=None):
+    def query(self, query_embeddings: list[list[float]], n_results: int = 5):
         if self._embs is None or self._embs.size == 0:
-            return {"documents":[[]], "metadatas":[[]], "distances":[[]], "ids":[[]]}
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
         q = _np.array(query_embeddings[0], dtype=_np.float32)
-        # cosine distances
         A = self._embs
         denom = (_np.linalg.norm(A, axis=1) * _np.linalg.norm(q) + 1e-12)
         sims = (A @ q) / denom
         idx = _np.argsort(-sims)[:n_results]
         docs = [self._docs[i] for i in idx]
         metas = [self._metas[i] for i in idx]
-        dists = [float(1.0 - sims[i]) for i in idx]  # smaller is closer
+        dists = [float(1.0 - sims[i]) for i in idx]
         ids = [self._ids[i] for i in idx]
-        return {"documents":[docs], "metadatas":[metas], "distances":[dists], "ids":[ids]}
+        return {"documents": [docs], "metadatas": [metas], "distances": [dists], "ids": [ids]}
 
 # --- Optional file parsers ---
 try:
@@ -256,13 +291,14 @@ CHROMA_DIR = os.getenv("CHROMA_DIR", "/tmp/chroma_db")
 CHROMA_COLLECTION = "cv_store"
 
 def _get_store():
-    """Return a (collection-like) object with add/count/query."""
-    chroma_client = _get_chroma_client()
-    col = _get_cv_collection(chroma_client)
+    """
+    Prefer Chroma collection; otherwise return SimpleStore.
+    Returns (store_obj, store_kind_str).
+    """
+    col = _get_chroma_collection()
     if col is not None:
-        return col, "chroma"
-    # fallback
-    return SimpleStore(), "simple"
+        return col, f"Chroma ({_CHROMA_VERSION or '?'})"
+    return SimpleStore(), "SimpleStore (fallback)"
 
 def _get_chroma_client():
     """Return a Chroma client; try persistent, then ephemeral; else None."""
@@ -2805,6 +2841,7 @@ from uuid import uuid4
 
 def index_cv_docs_to_store(files: list, label_prefix: str = "cv"):
     store, kind = _get_store()
+
     docs, ids, metas = [], [], []
     for f in files:
         try:
@@ -2816,28 +2853,26 @@ def index_cv_docs_to_store(files: list, label_prefix: str = "cv"):
             metas.append({"filename": getattr(f, "name", "uploaded_cv")})
         except Exception as e:
             st.warning(f"Failed to read {getattr(f, 'name', 'file')}: {e}")
+
     if not docs:
         return 0, []
 
     try:
-        vecs = embed_texts(docs)  # uses your OpenAI compat helper
+        vecs = embed_texts(docs)
     except Exception as e:
         st.error(f"Embedding failed: {e}")
         return 0, []
 
-    # Chroma collection has .add(...), SimpleStore mimics the same shape
+    # Both stores expose .add(...); Chroma ignores unknown kwargs gracefully
     try:
-        if kind == "chroma":
-            store.add(documents=docs, metadatas=metas, ids=ids, embeddings=vecs)
-            try:
-                # persist only if supported
-                _client = _get_chroma_client()
-                if _client and hasattr(_client, "persist"):
-                    _client.persist()
-            except Exception:
-                pass
-        else:  # SimpleStore
-            store.add(documents=docs, metadatas=metas, ids=ids, embeddings=vecs)
+        store.add(documents=docs, metadatas=metas, ids=ids, embeddings=vecs)
+        # Persist if it's a Chroma PersistentClient (Ephemeral/ SimpleStore no-op)
+        try:
+            # best-effort: PersistentClient has persist(); others won’t
+            if hasattr(store, "client") and hasattr(store.client, "persist"):
+                store.client.persist()
+        except Exception:
+            pass
         return len(ids), ids
     except Exception as e:
         st.error(f"Add to store failed: {e}")
@@ -2845,29 +2880,32 @@ def index_cv_docs_to_store(files: list, label_prefix: str = "cv"):
 
 def query_cv_store(question: str, top_k: int = 5):
     store, kind = _get_store()
-    # count
+
+    # Count
     try:
-        current_count = store.count() if kind == "chroma" else store.count()
+        current_count = store.count()
     except Exception:
         current_count = 0
     if current_count == 0:
-        return {"documents":[[]], "metadatas":[[]], "distances":[[]]}
+        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
 
+    # Embed query
     try:
         q_vec = embed_texts([question])[0]
     except Exception as e:
         st.error(f"Embedding query failed: {e}")
-        return None
+        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
 
+    # Query (Chroma has .query; SimpleStore emulates it)
     try:
-        if kind == "chroma":
+        if hasattr(store, "query"):
             return store.query(query_embeddings=[q_vec], n_results=int(top_k),
                                include=["documents", "metadatas", "distances"])
-        else:
-            return store.query(query_embeddings=[q_vec], n_results=int(top_k))
+        # Fallback: SimpleStore query signature (no include kw)
+        return store.query(query_embeddings=[q_vec], n_results=int(top_k))
     except Exception as e:
         st.error(f"Store query failed: {e}")
-        return None
+        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
 
 def rag_answer_over_cvs(question: str, retrieved, model: str = "gpt-4o-mini") -> str:
     """
@@ -2950,7 +2988,9 @@ with st.expander("Build & Query Local CV Store (Chroma)", expanded=False):
         col = _get_cv_collection(chroma_client)
         current_count = _chroma_count(col) if col else 0
         st.caption(f"📦 Stored CV documents: **{current_count}**  (folder: `{CHROMA_DIR}`)")
-        st.caption(f"Vector store: {'Chroma ' + (CHROMA_VERSION or '?') if chroma_mod else 'SimpleStore (fallback)'}  | path: {CHROMA_DIR}")
+        store_obj, store_name = _get_store()
+        st.caption(f"Vector store: {store_name}  | path: {CHROMA_DIR if 'Chroma' in store_name else '/tmp/cv_simple_store.npz'}")
+
 
         uploaded_cvs = st.file_uploader(
             "Upload multiple CV files (PDF/DOCX/TXT) to index into the local store",
@@ -2966,7 +3006,7 @@ with st.expander("Build & Query Local CV Store (Chroma)", expanded=False):
                     st.info("Upload at least one CV file first.")
                 else:
                     with st.spinner("Indexing CVs into local store…"):
-                        added_count, ids = index_cv_docs_to_chroma(uploaded_cvs)
+                        added_count, ids = index_cv_docs_to_store(uploaded_cvs)
                         if added_count:
                             st.success(f"Indexed {added_count} document(s) into the local store.")
                         else:
