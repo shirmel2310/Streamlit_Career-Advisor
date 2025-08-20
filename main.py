@@ -98,62 +98,70 @@ def _chroma_count(col) -> int:
         except Exception:
             return 0
 
-# ---------- Simple fallback store (file-backed cosine) ----------
+# ---------- Session-backed fallback store (always works on Streamlit Cloud) ----------
 import numpy as _np
 
-class SimpleStore:
-    """Tiny cosine-similarity store persisted to /tmp as NPZ."""
-    def __init__(self, path: str = "/tmp/cv_simple_store.npz"):
-        self.path = path
-        self._docs: list[str] = []
-        self._metas: list[dict] = []
-        self._ids: list[str] = []
-        self._embs: _np.ndarray | None = None
-        self._load()
+class SessionStore:
+    """Tiny cosine-similarity store kept in st.session_state (no disk)."""
+    _DOCS_KEY = "ss_docs"
+    _METAS_KEY = "ss_metas"
+    _IDS_KEY = "ss_ids"
+    _EMBS_KEY = "ss_embs"   # list[list[float]]
 
-    def _load(self):
-        try:
-            data = _np.load(self.path, allow_pickle=True)
-            self._docs = list(data["docs"])
-            self._metas = list(data["metas"])
-            self._ids = list(data["ids"])
-            embs = data["embs"]
-            self._embs = _np.array(embs) if embs.size else None
-        except Exception:
-            self._docs, self._metas, self._ids, self._embs = [], [], [], None
+    def __init__(self):
+        st.session_state.setdefault(self._DOCS_KEY, [])
+        st.session_state.setdefault(self._METAS_KEY, [])
+        st.session_state.setdefault(self._IDS_KEY, [])
+        st.session_state.setdefault(self._EMBS_KEY, [])
 
-    def _save(self):
-        _np.savez_compressed(
-            self.path,
-            docs=_np.array(self._docs, dtype=object),
-            metas=_np.array(self._metas, dtype=object),
-            ids=_np.array(self._ids, dtype=object),
-            embs=_np.array(self._embs) if self._embs is not None else _np.zeros((0, 0), dtype=_np.float32),
-        )
+    # Internal getters
+    @property
+    def _docs(self) -> list[str]:
+        return st.session_state[self._DOCS_KEY]
+
+    @property
+    def _metas(self) -> list[dict]:
+        return st.session_state[self._METAS_KEY]
+
+    @property
+    def _ids(self) -> list[str]:
+        return st.session_state[self._IDS_KEY]
+
+    @property
+    def _embs(self) -> list[list[float]]:
+        return st.session_state[self._EMBS_KEY]
 
     def add(self, documents: list[str], metadatas: list[dict], ids: list[str], embeddings: list[list[float]]):
-        embs = _np.array(embeddings, dtype=_np.float32)
         self._docs.extend(documents)
         self._metas.extend(metadatas)
         self._ids.extend(ids)
-        self._embs = embs if self._embs is None or self._embs.size == 0 else _np.vstack([self._embs, embs])
-        self._save()
+        # ensure embeddings are plain Python lists of floats
+        for v in embeddings:
+            if isinstance(v, _np.ndarray):
+                self._embs.append([float(x) for x in v.tolist()])
+            else:
+                self._embs.append([float(x) for x in v])
 
     def count(self) -> int:
         return len(self._ids)
 
     def query(self, query_embeddings: list[list[float]], n_results: int = 5):
-        if self._embs is None or self._embs.size == 0:
+        if not self._embs:
             return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+
         q = _np.array(query_embeddings[0], dtype=_np.float32)
-        A = self._embs
+        A = _np.array(self._embs, dtype=_np.float32)
+
+        # cosine similarity
         denom = (_np.linalg.norm(A, axis=1) * _np.linalg.norm(q) + 1e-12)
         sims = (A @ q) / denom
         idx = _np.argsort(-sims)[:n_results]
+
         docs = [self._docs[i] for i in idx]
         metas = [self._metas[i] for i in idx]
         dists = [float(1.0 - sims[i]) for i in idx]
         ids = [self._ids[i] for i in idx]
+
         return {"documents": [docs], "metadatas": [metas], "distances": [dists], "ids": [ids]}
 
 # --- Optional file parsers ---
@@ -292,13 +300,21 @@ CHROMA_COLLECTION = "cv_store"
 
 def _get_store():
     """
-    Prefer Chroma collection; otherwise return SimpleStore.
-    Returns (store_obj, store_kind_str).
+    Prefer a Chroma collection if available; otherwise use SessionStore (in-memory).
+    Returns (store_obj, store_name_str).
     """
-    col = _get_chroma_collection()
+    try:
+        col = _get_chroma_collection()  # your existing function that returns a Chroma collection or None
+    except Exception:
+        col = None
+
     if col is not None:
-        return col, f"Chroma ({_CHROMA_VERSION or '?'})"
-    return SimpleStore(), "SimpleStore (fallback)"
+        # Chroma path
+        store_name = f"Chroma ({CHROMA_VERSION or '?'})"
+        return col, store_name
+
+    # SessionStore fallback (works on Streamlit Cloud)
+    return SessionStore(), "SessionStore (in-memory)"
 
 def _get_chroma_client():
     """Return a Chroma client; try persistent, then ephemeral; else None."""
@@ -2836,39 +2852,39 @@ if cv_file:
                     st.markdown("**Summary**")
                     st.write(candidate.summary)
 
-
 from uuid import uuid4
 
 def index_cv_docs_to_store(files: list, label_prefix: str = "cv"):
-    store, kind = _get_store()
+    store, store_name = _get_store()
+    docs, metas, ids = [], [], []
 
-    docs, ids, metas = [], [], []
     for f in files:
         try:
             text = read_cv_file(f)
             if not text.strip():
                 continue
             docs.append(text)
-            ids.append(f"{label_prefix}-{uuid4().hex[:12]}")
             metas.append({"filename": getattr(f, "name", "uploaded_cv")})
+            ids.append(f"{label_prefix}-{uuid4().hex[:12]}")
         except Exception as e:
             st.warning(f"Failed to read {getattr(f, 'name', 'file')}: {e}")
 
     if not docs:
         return 0, []
 
+    # Embed
     try:
-        vecs = embed_texts(docs)
+        vecs = embed_texts(docs)  # your fixed compat wrapper
     except Exception as e:
         st.error(f"Embedding failed: {e}")
         return 0, []
 
-    # Both stores expose .add(...); Chroma ignores unknown kwargs gracefully
+    # Add to whichever store we have
     try:
+        # Both Chroma and SessionStore expose .add(documents=..., metadatas=..., ids=..., embeddings=...)
         store.add(documents=docs, metadatas=metas, ids=ids, embeddings=vecs)
-        # Persist if it's a Chroma PersistentClient (Ephemeral/ SimpleStore no-op)
+        # Best-effort persist for Chroma (SessionStore is in-memory)
         try:
-            # best-effort: PersistentClient has persist(); others won’t
             if hasattr(store, "client") and hasattr(store.client, "persist"):
                 store.client.persist()
         except Exception:
@@ -2879,14 +2895,15 @@ def index_cv_docs_to_store(files: list, label_prefix: str = "cv"):
         return 0, []
 
 def query_cv_store(question: str, top_k: int = 5):
-    store, kind = _get_store()
+    store, store_name = _get_store()
 
     # Count
     try:
-        current_count = store.count()
+        current = store.count()
     except Exception:
-        current_count = 0
-    if current_count == 0:
+        current = 0
+
+    if current == 0:
         return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
 
     # Embed query
@@ -2896,13 +2913,19 @@ def query_cv_store(question: str, top_k: int = 5):
         st.error(f"Embedding query failed: {e}")
         return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
 
-    # Query (Chroma has .query; SimpleStore emulates it)
+    # Query (Chroma and SessionStore both implement .query(...))
     try:
+        # Chroma supports include=..., SessionStore ignores it by not accepting the kw
         if hasattr(store, "query"):
-            return store.query(query_embeddings=[q_vec], n_results=int(top_k),
-                               include=["documents", "metadatas", "distances"])
-        # Fallback: SimpleStore query signature (no include kw)
-        return store.query(query_embeddings=[q_vec], n_results=int(top_k))
+            try:
+                return store.query(query_embeddings=[q_vec], n_results=int(top_k),
+                                   include=["documents", "metadatas", "distances"])
+            except TypeError:
+                # SessionStore path (no include kw)
+                return store.query(query_embeddings=[q_vec], n_results=int(top_k))
+        else:
+            # Extremely defensive fallback
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
     except Exception as e:
         st.error(f"Store query failed: {e}")
         return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
@@ -2987,9 +3010,9 @@ with st.expander("Build & Query Local CV Store (Chroma)", expanded=False):
         chroma_client = _get_chroma_client()
         col = _get_cv_collection(chroma_client)
         current_count = _chroma_count(col) if col else 0
-        st.caption(f"📦 Stored CV documents: **{current_count}**  (folder: `{CHROMA_DIR}`)")
         store_obj, store_name = _get_store()
-        st.caption(f"Vector store: {store_name}  | path: {CHROMA_DIR if 'Chroma' in store_name else '/tmp/cv_simple_store.npz'}")
+        st.caption(f"Vector store: {store_name}")
+
 
 
         uploaded_cvs = st.file_uploader(
