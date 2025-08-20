@@ -7,6 +7,6 @@ pdfplumber>=0.11
 docx2txt>=0.8
 pandas>=2.1
 numpy>=1.25
-chromadb>=0.5       # if you’re using the local RAG store
+chromadb==0.5.5
 selenium>=4.22      # optional; app won’t break if unused
 webdriver-manager>=4.0
