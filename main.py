@@ -310,6 +310,8 @@ if st.session_state.get("show_methodology", False):
 5. Scoring: cosine similarity (candidate vector vs. job text).  
 6. Skill overlaps: substring match of candidate skills in job title+description.  
 7. Ranking: sort by similarity (desc), then overlap count.
+8. Implement local file-based document store for upload of multiple CVs to index and store
+9. RAG applied on the indexed CVs (no user accounts needed) to determine CV of best fit based on query
             """
         )
         st.button("Close", key=METH_CLOSE_KEY, on_click=_close, args=("show_methodology",))
